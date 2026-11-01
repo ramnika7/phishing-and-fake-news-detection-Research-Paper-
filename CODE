@@ -1,0 +1,536 @@
+"""
+Phishing website detector (URL in -> verdict out).
+
+Feature groups, in the order the pipeline computes them:
+  1. URL length
+  2. URL anchors, links in <meta>/<script>/<link> tags, Server Form Handler (SFH)
+  3. Redirects, pop-ups, right-click disabling, iframes
+  4. Domain age, DNS records, web traffic, page rank
+  5. URL string (lexical) features  -- the most heavily used group
+
+Usage
+-----
+  # train from a CSV with columns: url,label   (label: 1 = phishing, 0 = legitimate)
+  python phishing_detector.py train --data urls.csv --model model.joblib
+
+  # classify a URL
+  python phishing_detector.py predict --model model.joblib --url https://example.com
+
+  # string-features-only mode (no network access needed, fast, good for large datasets)
+  python phishing_detector.py train --data urls.csv --model model.joblib --offline
+"""
+import argparse
+import math
+import re
+import socket
+import ssl
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from urllib.parse import urlparse, urljoin
+
+import joblib
+import numpy as np
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.model_selection import train_test_split
+
+try:
+    import tldextract
+except ImportError:  # fall back to a naive split
+    tldextract = None
+try:
+    import whois  # python-whois
+except ImportError:
+    whois = None
+try:
+    import dns.resolver  # dnspython
+except ImportError:
+    dns = None
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (PhishingDetector research bot)"}
+TIMEOUT = 6
+SHORTENERS = re.compile(
+    r"bit\.ly|goo\.gl|tinyurl|ow\.ly|t\.co|is\.gd|buff\.ly|adf\.ly|cutt\.ly|rb\.gy|shorturl"
+)
+SUSPICIOUS_TLDS = {"zip", "xyz", "top", "tk", "ml", "ga", "cf", "gq", "click", "country",
+                   "work", "link", "support", "loan", "icu", "cam", "rest", "monster"}
+BRAND_WORDS = ["paypal", "apple", "google", "microsoft", "amazon", "netflix", "facebook",
+               "instagram", "bank", "hdfc", "sbi", "icici", "paytm", "login", "secure",
+               "verify", "account", "update", "signin", "wallet", "confirm", "password"]
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def normalise(url: str) -> str:
+    url = url.strip()
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "http://" + url
+    return url
+
+
+_TLD = tldextract.TLDExtract(suffix_list_urls=()) if tldextract else None  # use bundled suffix list, no network
+
+
+def split_domain(host: str):
+    if _TLD:
+        ext = _TLD(host)
+        return ext.subdomain, ext.domain, ext.suffix
+    parts = host.split(".")
+    if len(parts) >= 2:
+        return ".".join(parts[:-2]), parts[-2], parts[-1]
+    return "", host, ""
+
+
+def registered_domain(host: str) -> str:
+    sub, dom, suf = split_domain(host)
+    return f"{dom}.{suf}".strip(".")
+
+
+def entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    n = len(s)
+    return -sum(c / n * math.log2(c / n) for c in counts.values())
+
+
+def is_ip(host: str) -> bool:
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host):
+        return True
+    if re.fullmatch(r"0x[0-9a-fA-F]+", host):  # hex-encoded IP
+        return True
+    return ":" in host and re.fullmatch(r"[0-9a-fA-F:]+", host) is not None
+
+
+# --------------------------------------------------------------------------- #
+# 1. URL length
+# --------------------------------------------------------------------------- #
+def length_features(url: str) -> dict:
+    p = urlparse(url)
+    return {
+        "url_length": len(url),
+        "host_length": len(p.netloc),
+        "path_length": len(p.path),
+        "query_length": len(p.query),
+        "url_length_class": 1 if len(url) < 54 else (0 if len(url) <= 75 else -1),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 2-3. Page content features (anchors, tag links, SFH, redirects, popups, ...)
+# --------------------------------------------------------------------------- #
+CONTENT_DEFAULTS = {
+    "fetch_ok": 0,
+    "anchor_unsafe_ratio": 0.0,       # <a href="#">, javascript:void, empty, or other domain
+    "anchor_external_ratio": 0.0,
+    "tag_links_external_ratio": 0.0,  # <meta>, <script>, <link>
+    "img_external_ratio": 0.0,        # resources loaded from other domains
+    "sfh_class": 0,                   # 1 legit, 0 suspicious (other domain), -1 blank/about:blank
+    "has_password_form": 0,
+    "mailto_in_form": 0,
+    "redirect_count": 0,
+    "redirect_cross_domain": 0,
+    "js_redirect": 0,
+    "meta_refresh": 0,
+    "popup_window": 0,                # window.open / alert prompts
+    "right_click_disabled": 0,        # event.button==2 / contextmenu return false
+    "iframe_count": 0,
+    "iframe_hidden": 0,               # frameBorder=0 / display:none / zero size
+    "status_bar_mod": 0,              # onmouseover changing window.status
+    "favicon_external": 0,
+    "title_empty": 1,
+}
+
+
+def content_features(url: str) -> dict:
+    f = dict(CONTENT_DEFAULTS)
+    host = urlparse(url).netloc.lower()
+    base = registered_domain(host)
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True,
+                            verify=False)
+    except Exception:
+        return f
+    f["fetch_ok"] = 1
+
+    # --- redirects ---------------------------------------------------------- #
+    f["redirect_count"] = len(resp.history)
+    final_base = registered_domain(urlparse(resp.url).netloc.lower())
+    f["redirect_cross_domain"] = int(bool(resp.history) and final_base != base)
+
+    html = resp.text or ""
+    soup = BeautifulSoup(html, "html.parser")
+    low = html.lower()
+
+    def other_domain(link: str) -> bool:
+        if not link or link.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            return False
+        full = urljoin(resp.url, link)
+        h = urlparse(full).netloc.lower()
+        return bool(h) and registered_domain(h) != final_base
+
+    # --- URL of anchor ------------------------------------------------------ #
+    anchors = soup.find_all("a", href=True)
+    if anchors:
+        unsafe = 0
+        ext = 0
+        for a in anchors:
+            href = a["href"].strip().lower()
+            if href in ("", "#", "#content", "#skip") or href.startswith("javascript:"):
+                unsafe += 1
+            elif other_domain(href):
+                unsafe += 1
+                ext += 1
+        f["anchor_unsafe_ratio"] = unsafe / len(anchors)
+        f["anchor_external_ratio"] = ext / len(anchors)
+
+    # --- links in <meta>, <script>, <link> ---------------------------------- #
+    tag_links = []
+    for t in soup.find_all("script", src=True):
+        tag_links.append(t["src"])
+    for t in soup.find_all("link", href=True):
+        tag_links.append(t["href"])
+    for t in soup.find_all("meta", content=True):
+        m = re.search(r"https?://[^\s'\"]+", t["content"])
+        if m:
+            tag_links.append(m.group(0))
+    if tag_links:
+        f["tag_links_external_ratio"] = sum(other_domain(x) for x in tag_links) / len(tag_links)
+
+    imgs = [i.get("src", "") for i in soup.find_all("img")]
+    if imgs:
+        f["img_external_ratio"] = sum(other_domain(x) for x in imgs) / len(imgs)
+
+    # --- server form handler ------------------------------------------------ #
+    forms = soup.find_all("form")
+    sfh = 1
+    for form in forms:
+        action = (form.get("action") or "").strip().lower()
+        if action in ("", "about:blank"):
+            sfh = min(sfh, -1)
+        elif other_domain(action):
+            sfh = min(sfh, 0)
+        if action.startswith("mailto:") or "mail(" in low:
+            f["mailto_in_form"] = 1
+        if form.find("input", {"type": "password"}):
+            f["has_password_form"] = 1
+    f["sfh_class"] = sfh if forms else 1
+
+    # --- JS/meta redirects, pop-ups, right-click ---------------------------- #
+    f["meta_refresh"] = int(bool(soup.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})))
+    f["js_redirect"] = int(bool(re.search(r"(window|document|top|self)\.location(\.href)?\s*=|location\.replace\(", low)))
+    f["popup_window"] = int("window.open(" in low or bool(re.search(r"\bprompt\(", low)))
+    f["right_click_disabled"] = int(
+        "event.button==2" in low.replace(" ", "")
+        or "contextmenu" in low and "return false" in low
+        or "oncontextmenu" in low
+    )
+    f["status_bar_mod"] = int(bool(re.search(r"onmouseover\s*=\s*[\"'][^\"']*window\.status", low)))
+
+    # --- iframes ------------------------------------------------------------ #
+    iframes = soup.find_all("iframe")
+    f["iframe_count"] = len(iframes)
+    for fr in iframes:
+        style = (fr.get("style") or "").replace(" ", "").lower()
+        if (fr.get("frameborder") in ("0", 0) or "display:none" in style
+                or "visibility:hidden" in style or fr.get("width") in ("0", "1")
+                or fr.get("height") in ("0", "1")):
+            f["iframe_hidden"] = 1
+
+    # --- favicon / title ---------------------------------------------------- #
+    icon = soup.find("link", rel=lambda r: r and "icon" in " ".join(r).lower())
+    if icon and icon.get("href"):
+        f["favicon_external"] = int(other_domain(icon["href"]))
+    f["title_empty"] = int(not (soup.title and soup.title.get_text(strip=True)))
+    return f
+
+
+# --------------------------------------------------------------------------- #
+# 4. Domain age, DNS, web traffic, page rank
+# --------------------------------------------------------------------------- #
+DOMAIN_DEFAULTS = {
+    "domain_age_days": -1,
+    "domain_expiry_days": -1,
+    "whois_ok": 0,
+    "dns_a_count": 0,
+    "dns_has_mx": 0,
+    "dns_has_ns": 0,
+    "dns_has_txt": 0,
+    "dns_record_ok": 0,
+    "dns_min_ttl": -1,
+    "traffic_rank": -1,      # lower = more popular, -1 unknown
+    "page_rank": -1,         # 0-10, higher = more reputable, -1 unknown
+    "in_top_list": 0,
+    "ssl_valid": 0,
+    "ssl_age_days": -1,
+}
+
+
+def _to_dt(v):
+    if isinstance(v, list):
+        v = [x for x in v if x]
+        v = min(v) if v else None
+    if v is None:
+        return None
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=timezone.utc)
+    return v
+
+
+def whois_features(domain: str, f: dict):
+    if whois is None:
+        return
+    try:
+        w = whois.whois(domain)
+        created = _to_dt(w.creation_date)
+        expires = _to_dt(w.expiration_date)
+        now = datetime.now(timezone.utc)
+        if created:
+            f["domain_age_days"] = max((now - created).days, 0)
+            f["whois_ok"] = 1
+        if expires:
+            f["domain_expiry_days"] = (expires - now).days
+    except Exception:
+        pass
+
+
+def dns_features(host: str, f: dict):
+    if dns is None:
+        try:
+            ips = socket.gethostbyname_ex(host)[2]
+            f["dns_a_count"] = len(ips)
+            f["dns_record_ok"] = int(bool(ips))
+        except Exception:
+            pass
+        return
+    res = dns.resolver.Resolver()
+    res.lifetime = 4
+    ttls = []
+
+    def q(name, rtype):
+        try:
+            ans = res.resolve(name, rtype)
+            ttls.append(ans.rrset.ttl)
+            return list(ans)
+        except Exception:
+            return []
+
+    a = q(host, "A")
+    f["dns_a_count"] = len(a)
+    f["dns_record_ok"] = int(bool(a))
+    dom = registered_domain(host)
+    f["dns_has_mx"] = int(bool(q(dom, "MX")))
+    f["dns_has_ns"] = int(bool(q(dom, "NS")))
+    f["dns_has_txt"] = int(bool(q(dom, "TXT")))
+    if ttls:
+        f["dns_min_ttl"] = min(ttls)
+
+
+def ssl_features(host: str, f: dict):
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, 443), timeout=4) as s:
+            with ctx.wrap_socket(s, server_hostname=host) as ss:
+                cert = ss.getpeercert()
+        f["ssl_valid"] = 1
+        nb = datetime.strptime(cert["notBefore"], "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+        f["ssl_age_days"] = (datetime.now(timezone.utc) - nb).days
+    except Exception:
+        pass
+
+
+_TOP_LIST = {}
+
+
+def load_top_list(path: str):
+    """Optional: load a popularity list (e.g. Tranco top-1m CSV: rank,domain) for traffic rank."""
+    try:
+        df = pd.read_csv(path, header=None, names=["rank", "domain"])
+        _TOP_LIST.update(dict(zip(df["domain"], df["rank"])))
+    except Exception as e:
+        print(f"[warn] could not load top list: {e}", file=sys.stderr)
+
+
+def traffic_and_rank(domain: str, f: dict, openpagerank_key: str = None):
+    # Web traffic: rank from a local Tranco-style list.
+    if domain in _TOP_LIST:
+        r = int(_TOP_LIST[domain])
+        f["traffic_rank"] = r
+        f["in_top_list"] = 1
+    # Page rank: Open PageRank API (free key at domcop.com/openpagerank).
+    if openpagerank_key:
+        try:
+            r = requests.get("https://openpagerank.com/api/v1.0/getPageRank",
+                             params={"domains[]": domain},
+                             headers={"API-OPR": openpagerank_key}, timeout=TIMEOUT).json()
+            item = r["response"][0]
+            if item.get("status_code") == 200:
+                f["page_rank"] = float(item["page_rank_decimal"])
+        except Exception:
+            pass
+
+
+def domain_features(url: str, opr_key: str = None) -> dict:
+    f = dict(DOMAIN_DEFAULTS)
+    host = urlparse(url).netloc.split(":")[0].lower()
+    if not host or is_ip(host):
+        return f
+    dom = registered_domain(host)
+    whois_features(dom, f)
+    dns_features(host, f)
+    ssl_features(host, f)
+    traffic_and_rank(dom, f, opr_key)
+    return f
+
+
+# --------------------------------------------------------------------------- #
+# 5. URL string features (lexical) -- no network needed
+# --------------------------------------------------------------------------- #
+def url_string_features(url: str) -> dict:
+    p = urlparse(url)
+    host = p.netloc.split(":")[0].lower()
+    sub, dom, suf = split_domain(host)
+    path_q = p.path + ("?" + p.query if p.query else "")
+    full = url.lower()
+
+    digits = sum(c.isdigit() for c in url)
+    letters = sum(c.isalpha() for c in url)
+    sub_levels = len([s for s in sub.split(".") if s]) if sub else 0
+    words = re.split(r"[^a-z0-9]+", full)
+    brand_hits = sum(w in full for w in BRAND_WORDS)
+    brand_in_sub_or_path = sum(w in (sub + path_q).lower() for w in BRAND_WORDS)
+
+    return {
+        "has_ip": int(is_ip(host)),
+        "has_at": int("@" in url),
+        "double_slash_in_path": int("//" in url[8:]),
+        "dash_in_domain": int("-" in dom),
+        "dash_count_host": host.count("-"),
+        "dot_count": url.count("."),
+        "subdomain_levels": sub_levels,
+        "subdomain_length": len(sub),
+        "domain_length": len(dom),
+        "tld_length": len(suf),
+        "suspicious_tld": int(suf.split(".")[-1] in SUSPICIOUS_TLDS),
+        "https": int(p.scheme == "https"),
+        "https_in_host": int("https" in host),
+        "port_nonstandard": int(p.port not in (None, 80, 443)),
+        "is_shortener": int(bool(SHORTENERS.search(host))),
+        "digit_count": digits,
+        "letter_count": letters,
+        "digit_ratio": digits / max(len(url), 1),
+        "special_char_count": len(re.findall(r"[^A-Za-z0-9]", url)),
+        "question_marks": url.count("?"),
+        "equals_count": url.count("="),
+        "ampersand_count": url.count("&"),
+        "underscore_count": url.count("_"),
+        "tilde_count": url.count("~"),
+        "percent_count": url.count("%"),
+        "hash_count": url.count("#"),
+        "slash_count": url.count("/"),
+        "path_depth": len([x for x in p.path.split("/") if x]),
+        "query_param_count": len([x for x in p.query.split("&") if x]),
+        "host_entropy": entropy(host),
+        "path_entropy": entropy(path_q),
+        "url_entropy": entropy(url),
+        "digits_in_domain": sum(c.isdigit() for c in dom),
+        "longest_word_len": max((len(w) for w in words), default=0),
+        "avg_word_len": float(np.mean([len(w) for w in words if w])) if any(words) else 0.0,
+        "brand_keyword_count": brand_hits,
+        "brand_in_subdomain_or_path": brand_in_sub_or_path,
+        "punycode": int("xn--" in host),
+        "non_ascii": int(any(ord(c) > 127 for c in url)),
+        "file_extension_exec": int(bool(re.search(r"\.(exe|apk|zip|scr|php|html?|js)(\?|$)", p.path.lower()))),
+        "hex_encoded_chars": len(re.findall(r"%[0-9a-fA-F]{2}", url)),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline
+# --------------------------------------------------------------------------- #
+def extract_features(url: str, offline: bool = False, opr_key: str = None) -> dict:
+    url = normalise(url)
+    feats = {}
+    feats.update(length_features(url))                      # 1
+    if not offline:
+        feats.update(content_features(url))                 # 2 + 3
+        feats.update(domain_features(url, opr_key))         # 4
+    feats.update(url_string_features(url))                  # 5
+    return feats
+
+
+def build_matrix(urls, offline=False, opr_key=None, workers=16):
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=1 if offline else workers) as ex:
+        rows = list(ex.map(lambda u: extract_features(u, offline, opr_key), urls))
+    return pd.DataFrame(rows).fillna(-1)
+
+
+def train(args):
+    requests.packages.urllib3.disable_warnings()
+    if args.top_list:
+        load_top_list(args.top_list)
+    df = pd.read_csv(args.data)
+    assert {"url", "label"} <= set(df.columns), "CSV needs columns: url,label"
+    df = df.dropna(subset=["url", "label"]).drop_duplicates("url")
+    print(f"[info] {len(df)} URLs, phishing share = {df['label'].mean():.2%}")
+    X = build_matrix(df["url"].tolist(), args.offline, args.opr_key)
+    y = df["label"].astype(int).values
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+    clf = RandomForestClassifier(n_estimators=400, min_samples_leaf=2, n_jobs=-1,
+                                 class_weight="balanced", random_state=42)
+    clf.fit(Xtr, ytr)
+    proba = clf.predict_proba(Xte)[:, 1]
+    print(classification_report(yte, (proba >= 0.5).astype(int), target_names=["legit", "phishing"]))
+    if len(set(yte)) > 1:
+        print(f"ROC-AUC: {roc_auc_score(yte, proba):.4f}")
+    imp = pd.Series(clf.feature_importances_, index=X.columns).sort_values(ascending=False)
+    print("\nTop 15 features:\n", imp.head(15).round(4).to_string())
+    joblib.dump({"model": clf, "columns": list(X.columns), "offline": args.offline}, args.model)
+    print(f"\n[saved] {args.model}")
+
+
+def predict(args):
+    requests.packages.urllib3.disable_warnings()
+    if args.top_list:
+        load_top_list(args.top_list)
+    bundle = joblib.load(args.model)
+    feats = extract_features(args.url, bundle["offline"], args.opr_key)
+    X = pd.DataFrame([feats]).reindex(columns=bundle["columns"], fill_value=-1)
+    p = float(bundle["model"].predict_proba(X)[0, 1])
+    verdict = "PHISHING" if p >= args.threshold else "LEGITIMATE"
+    print(f"URL: {args.url}\nPhishing probability: {p:.1%}\nVerdict: {verdict}")
+    if args.explain:
+        print("\nFeatures:")
+        for k, v in feats.items():
+            print(f"  {k:28s} {v}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("train", "predict"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--model", default="model.joblib")
+        sp.add_argument("--top-list", help="Tranco-style CSV (rank,domain) for web-traffic rank")
+        sp.add_argument("--opr-key", help="Open PageRank API key for page rank")
+        if name == "train":
+            sp.add_argument("--data", required=True)
+            sp.add_argument("--offline", action="store_true", help="URL-string + length features only")
+            sp.set_defaults(fn=train)
+        else:
+            sp.add_argument("--url", required=True)
+            sp.add_argument("--threshold", type=float, default=0.5)
+            sp.add_argument("--explain", action="store_true")
+            sp.set_defaults(fn=predict)
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
